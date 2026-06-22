@@ -256,7 +256,7 @@ elif page == "⚙️ Mesin Deteksi Pajak":
 
             with st.spinner("⚡ Menjalankan inferensi deep learning..."):
                 model = load_yolo()
-                results = model(img_bgr, conf=0.35, verbose=False)
+                results = model(img_bgr, conf=0.45, verbose=False)
                 boxes = results[0].boxes
 
                 annotated_img = img_rgb.copy()
@@ -473,7 +473,7 @@ elif page == "⚙️ Mesin Deteksi Pajak":
 
                     # Jalankan inferensi YOLO hanya setiap skip_n frame
                     if frame_idx % skip_n == 0:
-                        res = model(frame, conf=0.35, verbose=False)
+                        res = model(frame, conf=0.45, verbose=False)
                         last_boxes = res[0].boxes
                         box_labels.clear()
 
@@ -728,7 +728,7 @@ elif page == "⚙️ Mesin Deteksi Pajak":
                             ai_busy[0] = True
 
                         try:
-                            res = model(frame_to_process, conf=0.35, verbose=False)
+                            res = model(frame_to_process, conf=0.45, verbose=False)
                             boxes = res[0].boxes
                             new_boxes = []
                             new_labels = {}

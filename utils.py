@@ -33,12 +33,17 @@ def load_ocr():
 # (model 1 kelas 'plat_nomor', tanpa preprocessing OpenCV tambahan,
 # parsing huruf/angka manual, dan aturan status AKTIF/MATI berbasis bulan & tahun).
 
+_OCR_MAX_WIDTH = 200  # px — downscale large crops for speed
+_OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
+
 def ocr_and_predict(crop_bgr, reader=None):
     """
     OCR plat — identik dengan ocr_plate() pada notebook referensi.
     EasyOCR dijalankan langsung pada crop tanpa preprocessing tambahan
     (tidak ada CLAHE/threshold/sharpening) agar perilaku deteksi sama
     persis dengan hasil training/notebook.
+    Optimasi: crop di-resize ke maks 200px lebar sebelum OCR, dan
+    allowlist dibatasi pada karakter plat nomor untuk mempercepat inferensi.
     Return (text_gabungan, confidence_rata_rata_persen).
     """
     if reader is None:
@@ -47,8 +52,19 @@ def ocr_and_predict(crop_bgr, reader=None):
     if crop_bgr is None or crop_bgr.size == 0:
         return "", 0.0
 
+    # --- Resize crop agar OCR lebih cepat ---
+    h, w = crop_bgr.shape[:2]
+    if w > _OCR_MAX_WIDTH:
+        scale = _OCR_MAX_WIDTH / w
+        crop_bgr = cv2.resize(crop_bgr, (_OCR_MAX_WIDTH, int(h * scale)),
+                              interpolation=cv2.INTER_AREA)
+
     try:
-        result = reader.readtext(crop_bgr, detail=1)
+        result = reader.readtext(
+            crop_bgr, detail=1,
+            paragraph=False,
+            allowlist=_OCR_ALLOWLIST,
+        )
     except Exception:
         return "", 0.0
 
