@@ -14,11 +14,15 @@ from pathlib import Path
 @st.cache_resource
 def load_yolo():
     from ultralytics import YOLO
-    model_path = Path("best.onnx")
+    import torch
+    model_path = Path("best.pt")
     if not model_path.exists():
-        st.error("File 'best.onnx' tidak ditemukan di folder proyek!")
+        st.error("File 'best.pt' tidak ditemukan di folder proyek!")
         st.stop()
-    return YOLO(str(model_path), task="detect")
+    model = YOLO(str(model_path))
+    if torch.cuda.is_available():
+        model.to("cuda")
+    return model
 
 @st.cache_resource
 def load_ocr():

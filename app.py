@@ -179,7 +179,7 @@ elif page == "📖 Deskripsi & Latar Belakang":
             <div class='info-card-title'>Pipeline Kecerdasan Buatan AutoTax</div>
             <div class='info-card-body'>
                 Sistem AutoTax meniadakan kebutuhan penghentian laju kendaraan. Citra kendaraan ditangkap via CCTV,
-                diproses instan menggunakan model <b>YOLOv11 ONNX</b> untuk mengunci citra plat,
+                diproses instan menggunakan model <b>YOLOv8 PyTorch (best.pt)</b> untuk mengunci citra plat,
                 lalu diserahkan ke mesin <b>EasyOCR</b> untuk penentuan tanggal kedaluwarsa pajak.
             </div>
         </div>
@@ -188,7 +188,7 @@ elif page == "📖 Deskripsi & Latar Belakang":
             <div class='info-card-title'>Tumpukan Teknologi (Tech Stack)</div>
             <div class='info-card-body' style='display: flex; flex-direction: column; gap: 10px; margin-top: 10px;'>
                 <div style='display: flex; align-items: center; gap: 10px;'>
-                    <span style='background: #fef3c7; color: #d97706; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 0.78rem; font-weight: 700; min-width: 110px; text-align: center;'>YOLOv11 ONNX</span>
+                    <span style='background: #fef3c7; color: #d97706; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 0.78rem; font-weight: 700; min-width: 110px; text-align: center;'>YOLOv8 PyTorch</span>
                     <span style='font-size: 0.85rem; font-weight: 500;'>Deteksi objek plat nomor presisi tinggi</span>
                 </div>
                 <div style='display: flex; align-items: center; gap: 10px;'>
