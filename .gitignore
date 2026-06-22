@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.streamlit/
+venv/
+.venv/
+uploads/
+easyocr_models/
+app copy.py
+backup.html
