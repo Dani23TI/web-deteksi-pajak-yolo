@@ -536,10 +536,10 @@ elif page == "⚙️ Mesin Deteksi Pajak":
                             color = (180, 180, 180)
                             label_txt = "Scanning..."
 
-                    cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color, 3)
-                    cv2.rectangle(frame_rgb, (x1, max(y1 - 30, 0)), (x2, y1), color, -1)
-                    cv2.putText(frame_rgb, label_txt, (x1 + 6, max(y1 - 8, 14)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+                        cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color, 3)
+                        cv2.rectangle(frame_rgb, (x1, max(y1 - 30, 0)), (x2, y1), color, -1)
+                        cv2.putText(frame_rgb, label_txt, (x1 + 6, max(y1 - 8, 14)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
                 # Overlay info frame di pojok kiri atas
                 pct = int(100 * frame_idx / total_frames) if total_frames > 0 else 0
