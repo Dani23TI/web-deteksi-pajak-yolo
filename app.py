@@ -5,8 +5,6 @@ import re
 import calendar
 import tempfile
 import os
-import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -18,17 +16,167 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- ADVANCED UI/UX STYLING ENGINE ---
-# --- LOAD CSS STYLING ---
-def load_css(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
+# --- ENGINE PENGHUBUNG STYLE.CSS EKSTERNAL ---
+def local_css(file_name):
+    with open(file_name, "r") as f:
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
-load_css("style.css")
+# Panggil fungsi untuk memuat style.css
+if os.path.exists("style.css"):
+    local_css("style.css")
+else:
+    st.error("Berkas style.css tidak ditemukan! Pastikan file berada di folder yang sama dengan app.py.")
 
 
 # --- LAZY-LOAD MODEL & OCR ---
-from utils import load_yolo, load_ocr, ocr_and_predict, extract_data, cek_status_pajak, conf_class, annotate_frame
+@st.cache_resource
+def load_yolo():
+    from ultralytics import YOLO
+    model_path = Path("best.onnx")
+    if not model_path.exists():
+        st.error("File 'best.onnx' tidak ditemukan di folder proyek!")
+        st.stop()
+    return YOLO(str(model_path), task="detect")
+
+@st.cache_resource
+def load_ocr():
+    import easyocr
+    import torch
+    return easyocr.Reader(["en"], gpu=torch.cuda.is_available(), model_storage_directory="./easyocr_models")
+
+
+# --- HELPER FUNCTIONS ---
+# Catatan: Logika OCR, ekstraksi data, dan pengecekan status pajak di bawah ini
+# disesuaikan 1:1 dengan notebook referensi "dataset2_sesuai_jurnal.ipynb"
+# (model 1 kelas 'plat_nomor', tanpa preprocessing OpenCV tambahan,
+# parsing huruf/angka manual, dan aturan status AKTIF/MATI berbasis bulan & tahun).
+
+def ocr_and_predict(crop_bgr):
+    """
+    OCR plat — identik dengan ocr_plate() pada notebook referensi.
+    EasyOCR dijalankan langsung pada crop tanpa preprocessing tambahan
+    (tidak ada CLAHE/threshold/sharpening) agar perilaku deteksi sama
+    persis dengan hasil training/notebook.
+    Return (text_gabungan, confidence_rata_rata_persen).
+    """
+    reader = load_ocr()
+
+    if crop_bgr is None or crop_bgr.size == 0:
+        return "", 0.0
+
+    try:
+        result = reader.readtext(crop_bgr, detail=1)
+    except Exception:
+        return "", 0.0
+
+    if not result:
+        return "", 0.0
+
+    text = " ".join([res[1] for res in result])
+    confs = [res[2] for res in result]
+    avg_conf = (sum(confs) / len(confs)) * 100 if confs else 0.0
+
+    return text, round(avg_conf, 1)
+
+
+def extract_data(text):
+    """
+    Ekstraksi nomor plat + bulan/tahun pajak — identik dengan extract_info()
+    pada notebook referensi: bersihkan teks, pisahkan token huruf vs angka,
+    lalu susun ulang sebagai plat (depan-nomor-belakang) dan cari pasangan
+    bulan(1-12)/tahun(>=20) dari deretan angka kecil.
+    """
+    text = text.upper()
+    text = re.sub(r'[^A-Z0-9]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    parts = text.split()
+
+    huruf = [p for p in parts if p.isalpha()]
+    angka = [p for p in parts if p.isdigit()]
+
+    # ===== BARIS 1 (PLAT) =====
+    depan = huruf[0] if len(huruf) > 0 else ""
+    nomor = max(angka, key=len) if len(angka) > 0 else ""
+    belakang = huruf[1][:2] if len(huruf) > 1 else ""
+
+    plat_gabungan = f"{depan} {nomor} {belakang}".strip()
+    nomor_plat = plat_gabungan if plat_gabungan else "Tidak Terbaca"
+
+    # ===== BARIS 2 (BULAN/TAHUN) =====
+    bulan, tahun = None, None
+    angka_kecil = [int(a) for a in angka if len(a) <= 2 and int(a) != 0]
+
+    for i in range(len(angka_kecil) - 1):
+        b = angka_kecil[i]
+        t = angka_kecil[i + 1]
+        if 1 <= b <= 12 and t >= 20:
+            bulan = b
+            tahun = 2000 + t
+            break
+
+    return nomor_plat, bulan, tahun
+
+
+def cek_status_pajak(bln, thn):
+    """
+    Status pajak — identik dengan cek_status() pada notebook referensi:
+    AKTIF jika (tahun > tahun_sekarang) atau (tahun == tahun_sekarang DAN
+    bulan >= bulan_sekarang). Selain itu MATI. Jika data tidak lengkap,
+    TIDAK TERBACA.
+    Return (status_str, color_rgb) — color_rgb dipertahankan untuk
+    kompatibilitas dengan kode anotasi bounding box yang sudah ada.
+    """
+    if bln is None or thn is None:
+        return "TIDAK TERBACA", (255, 193, 7)
+
+    now = datetime.now()
+
+    if (thn > now.year) or (thn == now.year and bln >= now.month):
+        return "PAJAK AKTIF", (1, 114, 114)
+    else:
+        return "PAJAK MATI", (224, 92, 58)
+
+
+def conf_class(conf):
+    """Kelas CSS warna berdasarkan nilai confidence (0-100)."""
+    if conf >= 80:
+        return "conf-high"
+    elif conf >= 50:
+        return "conf-mid"
+    return "conf-low"
+
+
+def annotate_frame(frame_rgb, boxes, frame_bgr):
+    """Jalankan OCR + annotasi pada satu frame. Return (frame_rgb_annotated, list_detections)."""
+    detections = []
+    for box in boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+        crop = frame_bgr[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        conf_yolo = float(box.conf[0]) * 100
+        raw_text, conf_ocr = ocr_and_predict(crop)
+        plat, bln, thn = extract_data(raw_text)
+        status, color_rgb = cek_status_pajak(bln, thn)
+
+        cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color_rgb, 3)
+        cv2.rectangle(frame_rgb, (x1, max(y1 - 34, 0)), (x2, y1), color_rgb, -1)
+        masa_str = f"{bln:02d}/{thn}" if bln and thn else "N/A"
+        label = f"{plat}  {masa_str}  ({conf_ocr:.0f}%)"
+        cv2.putText(frame_rgb, label, (x1 + 8, max(y1 - 10, 14)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+
+        detections.append({
+            "plat": plat,
+            "raw": raw_text if raw_text else "Tidak Ada Teks",
+            "masa": f"{bln:02d} / {thn}" if bln and thn else "Gagal Parsing",
+            "status": status,
+            "conf_yolo": conf_yolo,
+            "conf_ocr": conf_ocr,
+        })
+    return frame_rgb, detections
 
 
 # --- HISTORI DETEKSI (SESSION STATE) ---
@@ -120,7 +268,7 @@ if page == "👥 Pengenalan Kelompok":
 
     with col1:
         st.markdown("""
-        <div class='member-card m-blue'>
+        <div class='member-card'>
             <div class='member-avatar avatar-blue'>👨‍💻</div>
             <div class='member-name'>Dani Raditya M.</div>
             <div class='member-nim'>NIM: 2355301042</div>
@@ -130,7 +278,7 @@ if page == "👥 Pengenalan Kelompok":
 
     with col2:
         st.markdown("""
-        <div class='member-card m-green'>
+        <div class='member-card'>
             <div class='member-avatar avatar-green'>👩‍💻</div>
             <div class='member-name'>Elsha Amara Davia</div>
             <div class='member-nim'>NIM: 2355301056</div>
@@ -140,7 +288,7 @@ if page == "👥 Pengenalan Kelompok":
 
     with col3:
         st.markdown("""
-        <div class='member-card m-amber'>
+        <div class='member-card'>
             <div class='member-avatar avatar-amber'>👨‍🔧</div>
             <div class='member-name'>M. Rizal Wahyu</div>
             <div class='member-nim'>NIM: 2355301xxx</div>
@@ -179,30 +327,18 @@ elif page == "📖 Deskripsi & Latar Belakang":
             <div class='info-card-title'>Pipeline Kecerdasan Buatan AutoTax</div>
             <div class='info-card-body'>
                 Sistem AutoTax meniadakan kebutuhan penghentian laju kendaraan. Citra kendaraan ditangkap via CCTV,
-                diproses instan menggunakan model <b>YOLOv8 PyTorch (best.pt)</b> untuk mengunci citra plat,
+                diproses instan menggunakan model <b>YOLOv11 ONNX</b> untuk mengunci citra plat,
                 lalu diserahkan ke mesin <b>EasyOCR</b> untuk penentuan tanggal kedaluwarsa pajak.
             </div>
         </div>
         <div class='info-card card-green'>
             <span class='info-card-icon'>⚡</span>
-            <div class='info-card-title'>Tumpukan Teknologi (Tech Stack)</div>
-            <div class='info-card-body' style='display: flex; flex-direction: column; gap: 10px; margin-top: 10px;'>
-                <div style='display: flex; align-items: center; gap: 10px;'>
-                    <span style='background: #fef3c7; color: #d97706; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 0.78rem; font-weight: 700; min-width: 110px; text-align: center;'>YOLOv8 PyTorch</span>
-                    <span style='font-size: 0.85rem; font-weight: 500;'>Deteksi objek plat nomor presisi tinggi</span>
-                </div>
-                <div style='display: flex; align-items: center; gap: 10px;'>
-                    <span style='background: #e0f2fe; color: #0369a1; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 0.78rem; font-weight: 700; min-width: 110px; text-align: center;'>EasyOCR</span>
-                    <span style='font-size: 0.85rem; font-weight: 500;'>Ekstraksi teks plat & tanggal kedaluwarsa</span>
-                </div>
-                <div style='display: flex; align-items: center; gap: 10px;'>
-                    <span style='background: #d1fae5; color: #047857; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 0.78rem; font-weight: 700; min-width: 110px; text-align: center;'>Streamlit</span>
-                    <span style='font-size: 0.85rem; font-weight: 500;'>Dashboard monitoring interaktif</span>
-                </div>
-                <div style='display: flex; align-items: center; gap: 10px;'>
-                    <span style='background: #f1f5f9; color: #475569; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 0.78rem; font-weight: 700; min-width: 110px; text-align: center;'>OpenCV</span>
-                    <span style='font-size: 0.85rem; font-weight: 500;'>Pre-processing citra & rendering frame</span>
-                </div>
+            <div class='info-card-title'>Tumpukan Teknologi</div>
+            <div class='info-card-body'>
+                <span style='color:#ffcc21;'>YOLOv11-Nano ONNX</span> &nbsp;—&nbsp; Deteksi objek<br>
+                <span style='color:#00b4e0;'>EasyOCR</span> &nbsp;—&nbsp; Ekstraksi teks plat nomor<br>
+                <span style='color:#00c8c8;'>Streamlit</span> &nbsp;—&nbsp; Antarmuka web interaktif<br>
+                <span style='color:#a0a8d0;'>OpenCV</span> &nbsp;—&nbsp; Pre-Processing citra
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -256,7 +392,7 @@ elif page == "⚙️ Mesin Deteksi Pajak":
 
             with st.spinner("⚡ Menjalankan inferensi deep learning..."):
                 model = load_yolo()
-                results = model(img_bgr, conf=0.45, verbose=False)
+                results = model(img_bgr, conf=0.35, verbose=False)
                 boxes = results[0].boxes
 
                 annotated_img = img_rgb.copy()
@@ -430,116 +566,114 @@ elif page == "⚙️ Mesin Deteksi Pajak":
             tfile.close()
 
             cap = cv2.VideoCapture(tfile.name)
-            try:
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                fps_video    = cap.get(cv2.CAP_PROP_FPS) or 25
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps_video    = cap.get(cv2.CAP_PROP_FPS) or 25
 
-                model = load_yolo()
+            model = load_yolo()
 
-                # Layout: video kiri, log kanan
-                col_vid, col_log = st.columns([1.3, 1])
+            # Layout: video kiri, log kanan
+            col_vid, col_log = st.columns([1.3, 1])
 
-                with col_vid:
-                    st.markdown("<div class='card'>", unsafe_allow_html=True)
-                    st.markdown("<div class='section-label'>Live Annotated Stream</div>", unsafe_allow_html=True)
-                    # Placeholder progress info
-                    progress_info = st.empty()
-                    # Placeholder frame video
-                    frame_holder = st.empty()
-                    st.markdown("</div>", unsafe_allow_html=True)
+            with col_vid:
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown("<div class='section-label'>Live Annotated Stream</div>", unsafe_allow_html=True)
+                # Placeholder progress info
+                progress_info = st.empty()
+                # Placeholder frame video
+                frame_holder = st.empty()
+                st.markdown("</div>", unsafe_allow_html=True)
 
-                with col_log:
-                    st.markdown("<div class='section-label'>Real-time Log Scanning</div>", unsafe_allow_html=True)
-                    # Placeholder metric ringkasan
-                    metric_holder = st.empty()
-                    # Placeholder log kartu
-                    log_holder = st.empty()
+            with col_log:
+                st.markdown("<div class='section-label'>Real-time Log Scanning</div>", unsafe_allow_html=True)
+                # Placeholder metric ringkasan
+                metric_holder = st.empty()
+                # Placeholder log kartu
+                log_holder = st.empty()
 
-                # State untuk log & metric
-                detected_history = {}   # plat -> {masa, status, timestamp}
-                total_aktif_v = 0
-                total_mati_v  = 0
+            # State untuk log & metric
+            detected_history = {}   # plat -> {masa, status, timestamp}
+            total_aktif_v = 0
+            total_mati_v  = 0
 
-                frame_idx  = 0
-                last_boxes = []         # cache boxes dari frame sebelumnya
-                box_labels = {}         # cache OCR label untuk bounding boxes
+            frame_idx  = 0
+            last_boxes = []         # cache boxes dari frame sebelumnya
 
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    # Jalankan inferensi YOLO hanya setiap skip_n frame
-                    if frame_idx % skip_n == 0:
-                        res = model(frame, conf=0.45, verbose=False)
-                        last_boxes = res[0].boxes
-                        box_labels.clear()
+                # Jalankan inferensi YOLO hanya setiap skip_n frame
+                if frame_idx % skip_n == 0:
+                    res = model(frame, conf=0.35, verbose=False)
+                    last_boxes = res[0].boxes
 
-                        # OCR & annotasi hanya pada frame yang diinfer
-                        for bi, box in enumerate(last_boxes):
-                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            crop = frame[y1:y2, x1:x2]
-                            if crop.size == 0:
-                                continue
+                    # OCR & annotasi hanya pada frame yang diinfer
+                    for box in last_boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size == 0:
+                            continue
 
-                            conf_yolo = float(box.conf[0]) * 100
-                            raw_text, conf_ocr = ocr_and_predict(crop)
-                            plat, bln, thn = extract_data(raw_text)
-                            status, color_rgb = cek_status_pajak(bln, thn)
+                        conf_yolo = float(box.conf[0]) * 100
+                        raw_text, conf_ocr = ocr_and_predict(crop)
+                        plat, bln, thn = extract_data(raw_text)
+                        status, _ = cek_status_pajak(bln, thn)
 
-                            box_labels[bi] = {
-                                "plat": plat,
+                        # Simpan ke history hanya jika plat baru & berhasil dibaca
+                        if plat != "Tidak Terbaca" and plat not in detected_history:
+                            if status == "PAJAK AKTIF":
+                                total_aktif_v += 1
+                            elif status == "PAJAK MATI":
+                                total_mati_v += 1
+
+                            masa_fmt_v = f"{bln:02d} / {thn}" if bln and thn else "Gagal Parsing"
+
+                            detected_history[plat] = {
+                                "masa": masa_fmt_v,
                                 "status": status,
-                                "color": color_rgb,
-                                "label_txt": f"{plat} ({status})" if plat != "Tidak Terbaca" else "Tidak Terbaca"
+                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "conf_yolo": conf_yolo,
+                                "conf_ocr": conf_ocr,
                             }
 
-                            # Simpan ke history hanya jika plat baru & berhasil dibaca
-                            if plat != "Tidak Terbaca" and plat not in detected_history:
-                                if status == "PAJAK AKTIF":
-                                    total_aktif_v += 1
-                                elif status == "PAJAK MATI":
-                                    total_mati_v += 1
+                            # --- Catat otomatis ke Histori Deteksi ---
+                            catat_riwayat(
+                                sumber="Video",
+                                plat=plat,
+                                masa=masa_fmt_v,
+                                status=status,
+                                conf_yolo=conf_yolo,
+                                conf_ocr=conf_ocr,
+                                raw_ocr=raw_text if raw_text else "Tidak Ada Teks",
+                            )
 
-                                masa_fmt_v = f"{bln:02d} / {thn}" if bln and thn else "Gagal Parsing"
-
-                                detected_history[plat] = {
-                                    "masa": masa_fmt_v,
-                                    "status": status,
-                                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                    "conf_yolo": conf_yolo,
-                                    "conf_ocr": conf_ocr,
-                                }
-
-                                # --- Catat otomatis ke Histori Deteksi ---
-                                catat_riwayat(
-                                    sumber="Video",
-                                    plat=plat,
-                                    masa=masa_fmt_v,
-                                    status=status,
-                                    conf_yolo=conf_yolo,
-                                    conf_ocr=conf_ocr,
-                                    raw_ocr=raw_text if raw_text else "Tidak Ada Teks",
-                                )
-
-                    # Gambar bounding box dari cache last_boxes di SETIAP frame
-                    # supaya anotasi tetap muncul di frame yang di-skip
-                    for bi, box in enumerate(last_boxes):
-                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                        info = box_labels.get(bi, None)
-                        if info:
-                            color = info["color"]
-                            label_txt = info["label_txt"]
+                # Gambar bounding box dari cache last_boxes di SETIAP frame
+                # supaya anotasi tetap muncul di frame yang di-skip
+                for box in last_boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    # Warna default (abu) untuk frame yg di-skip, baru dapat warna asli setelah OCR
+                    # Cari di history apakah ada plat yang lokasinya cocok (pakai heuristik area)
+                    color = (180, 180, 180)
+                    label_txt = "..."
+                    # Cek history — ambil entry terakhir sebagai fallback label
+                    if detected_history:
+                        last_entry = list(detected_history.items())[-1]
+                        lbl_plat, lbl_data = last_entry
+                        if lbl_data["status"] == "PAJAK AKTIF":
+                            color = (1, 114, 114)
+                        elif lbl_data["status"] == "PAJAK MATI":
+                            color = (224, 92, 58)
                         else:
-                            color = (180, 180, 180)
-                            label_txt = "Scanning..."
+                            color = (255, 193, 7)
+                        label_txt = lbl_plat
 
-                        cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color, 3)
-                        cv2.rectangle(frame_rgb, (x1, max(y1 - 30, 0)), (x2, y1), color, -1)
-                        cv2.putText(frame_rgb, label_txt, (x1 + 6, max(y1 - 8, 14)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color, 3)
+                    cv2.rectangle(frame_rgb, (x1, max(y1 - 30, 0)), (x2, y1), color, -1)
+                    cv2.putText(frame_rgb, label_txt, (x1 + 6, max(y1 - 8, 14)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
                 # Overlay info frame di pojok kiri atas
                 pct = int(100 * frame_idx / total_frames) if total_frames > 0 else 0
@@ -623,12 +757,8 @@ elif page == "⚙️ Mesin Deteksi Pajak":
 
                 frame_idx += 1
 
-            finally:
-                cap.release()
-                try:
-                    os.unlink(tfile.name)   # Hapus file sementara
-                except Exception:
-                    pass
+            cap.release()
+            os.unlink(tfile.name)   # Hapus file sementara
 
             st.success(f"🎉 Pemrosesan selesai — {len(detected_history)} plat unik teridentifikasi dari {total_frames} frame.")
 
@@ -689,271 +819,171 @@ elif page == "⚙️ Mesin Deteksi Pajak":
             metric_holder_cam = st.empty()
             log_holder_cam = st.empty()
 
-        # Logic Execution Loop Kamera — THREADED (Non-Blocking)
+        # Logic Execution Loop Kamera (Sama dengan konsep Video)
         if start_cam and not stop_cam:
             cap_cam = cv2.VideoCapture(0)
-            try:
-                # Atur resolusi agar ringan saat pemrosesan OCR
-                cap_cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap_cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            
+            # Atur resolusi agar ringan saat pemrosesan OCR
+            cap_cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap_cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-                model = load_yolo()
-                reader_thread = load_ocr()
+            model = load_yolo()
 
-                # State storage (shared between threads via mutable containers)
-                cam_history = {}  # plat -> {masa, status, timestamp, conf_yolo, conf_ocr}
-                total_aktif_c = [0]   # list agar bisa diubah dari dalam thread
-                total_mati_c  = [0]
+            # State storage
+            cam_history = {}  # plat -> {masa, status, timestamp, conf_yolo, conf_ocr}
+            total_aktif_c = 0
+            total_mati_c  = 0
+            frame_idx_cam = 0
+            last_boxes_cam = []
 
-                # Shared state for the AI inference thread
-                ai_lock = threading.Lock()
-                ai_boxes = []        # bounding boxes dari hasil YOLO terakhir
-                ai_labels = {}       # box_idx -> {plat, status, color, label_txt}
-                ai_busy = [False]    # list agar bisa diubah dari dalam thread
-                ai_frame = [None]    # frame yang sedang/akan diproses AI
-                ai_stop = [False]    # signal stop ke thread
-                ai_new_detections = [] # queue of detections to record on main thread
+            while cap_cam.isOpened():
+                ret, frame = cap_cam.read()
+                if not ret:
+                    st.error("Gagal mendapatkan gambar dari kamera. Pastikan kamera tidak digunakan aplikasi lain.")
+                    break
 
-                def ai_worker():
-                    """Background thread: jalankan YOLO + OCR tanpa memblokir main loop."""
-                    while not ai_stop[0]:
-                        # Tunggu sampai ada frame baru untuk diproses
-                        if ai_frame[0] is None:
-                            time.sleep(0.01)
+                # Simpan clone frame asli (tidak kebalik) khusus untuk diproses AI (YOLO & OCR)
+                frame_ai = frame.copy()
+
+                # Jalankan inferensi YOLO & OCR hanya pada frame ke-N (Skip frame concept)
+                if frame_idx_cam % skip_n_cam == 0:
+                    res = model(frame_ai, conf=0.35, verbose=False)
+                    last_boxes_cam = res[0].boxes
+
+                    for box in last_boxes_cam:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        crop = frame_ai[y1:y2, x1:x2]
+                        if crop.size == 0:
                             continue
 
-                        with ai_lock:
-                            frame_to_process = ai_frame[0].copy()
-                            ai_frame[0] = None  # tandai sudah diambil
-                            ai_busy[0] = True
+                        conf_yolo = float(box.conf[0]) * 100
+                        raw_text, conf_ocr = ocr_and_predict(crop)
+                        plat, bln, thn = extract_data(raw_text)
+                        status, _ = cek_status_pajak(bln, thn)
 
-                        try:
-                            res = model(frame_to_process, conf=0.45, verbose=False)
-                            boxes = res[0].boxes
-                            new_boxes = []
-                            new_labels = {}
-                            pending_detections = []
+                        # Simpan ke log jika plat valid dan belum tercatat
+                        if plat != "Tidak Terbaca" and plat not in cam_history:
+                            if status == "PAJAK AKTIF":
+                                total_aktif_c += 1
+                            elif status == "PAJAK MATI":
+                                total_mati_c += 1
 
-                            for bi, box in enumerate(boxes):
-                                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                                crop = frame_to_process[y1:y2, x1:x2]
-                                if crop.size == 0:
-                                    continue
+                            masa_fmt_c = f"{bln:02d} / {thn}" if bln and thn else "Gagal Parsing"
 
-                                conf_yolo = float(box.conf[0]) * 100
-                                raw_text, conf_ocr = ocr_and_predict(crop, reader=reader_thread)
-                                plat, bln, thn = extract_data(raw_text)
-                                status, _ = cek_status_pajak(bln, thn)
+                            cam_history[plat] = {
+                                "masa": masa_fmt_c,
+                                "status": status,
+                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "conf_yolo": conf_yolo,
+                                "conf_ocr": conf_ocr,
+                            }
 
-                                # Warna berdasarkan status
-                                if status == "PAJAK AKTIF":
-                                    color = (3, 114, 114)
-                                elif status == "PAJAK MATI":
-                                    color = (255, 168, 0)
-                                else:
-                                    color = (252, 205, 23)
+                            # --- Catat otomatis ke Histori Deteksi ---
+                            catat_riwayat(
+                                sumber="Kamera",
+                                plat=plat,
+                                masa=masa_fmt_c,
+                                status=status,
+                                conf_yolo=conf_yolo,
+                                conf_ocr=conf_ocr,
+                                raw_ocr=raw_text if raw_text else "Tidak Ada Teks",
+                            )
 
-                                new_boxes.append((x1, y1, x2, y2))
-                                new_labels[bi] = {
-                                    "plat": plat, "status": status,
-                                    "color": color,
-                                    "label_txt": f"{plat} ({status})",
-                                }
+                # Gambar kotak anotasi langsung pada frame asli agar koordinat box-nya presisi
+                for box in last_boxes_cam:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    color = (180, 180, 180)
+                    label_txt = "Scanning Plat..."
 
-                                # Simpan ke pending jika plat valid dan belum tercatat
-                                if plat != "Tidak Terbaca":
-                                    pending_detections.append({
-                                        "plat": plat,
-                                        "bln": bln,
-                                        "thn": thn,
-                                        "status": status,
-                                        "conf_yolo": conf_yolo,
-                                        "conf_ocr": conf_ocr,
-                                        "raw_text": raw_text
-                                    })
-
-                            # Simpan hasil ke shared state
-                            with ai_lock:
-                                ai_boxes.clear()
-                                ai_boxes.extend(new_boxes)
-                                ai_labels.clear()
-                                ai_labels.update(new_labels)
-
-                                for det in pending_detections:
-                                    plat = det["plat"]
-                                    if plat not in cam_history:
-                                        status = det["status"]
-                                        if status == "PAJAK AKTIF":
-                                            total_aktif_c[0] += 1
-                                        elif status == "PAJAK MATI":
-                                            total_mati_c[0] += 1
-
-                                        bln, thn = det["bln"], det["thn"]
-                                        masa_fmt_c = f"{bln:02d} / {thn}" if bln and thn else "Gagal Parsing"
-
-                                        cam_history[plat] = {
-                                            "masa": masa_fmt_c,
-                                            "status": status,
-                                            "timestamp": datetime.now().strftime("%H:%M:%S"),
-                                            "conf_yolo": det["conf_yolo"],
-                                            "conf_ocr": det["conf_ocr"],
-                                        }
-
-                                        # Catat untuk diproses oleh main thread
-                                        ai_new_detections.append({
-                                            "plat": plat,
-                                            "masa": masa_fmt_c,
-                                            "status": status,
-                                            "conf_yolo": det["conf_yolo"],
-                                            "conf_ocr": det["conf_ocr"],
-                                            "raw_ocr": det["raw_text"] if det["raw_text"] else "Tidak Ada Teks",
-                                        })
-                        except Exception:
-                            pass
-                        finally:
-                            ai_busy[0] = False
-
-                # Mulai thread AI di background
-                ai_thread = threading.Thread(target=ai_worker, daemon=True)
-                ai_thread.start()
-
-                frame_idx_cam = 0
-
-                while cap_cam.isOpened():
-                    ret, frame = cap_cam.read()
-                    if not ret:
-                        st.error("Gagal mendapatkan gambar dari kamera. Pastikan kamera tidak digunakan aplikasi lain.")
-                        break
-
-                    frame_ai = frame.copy()
-
-                    # Kirim frame ke thread AI setiap N frame (hanya jika thread tidak sedang sibuk)
-                    if frame_idx_cam % skip_n_cam == 0 and not ai_busy[0]:
-                        with ai_lock:
-                            ai_frame[0] = frame.copy()
-
-                    # Gambar bounding box dari hasil AI terakhir (non-blocking)
-                    with ai_lock:
-                        current_boxes = list(ai_boxes)
-                        current_labels = dict(ai_labels)
-
-                    for bi, (x1, y1, x2, y2) in enumerate(current_boxes):
-                        info = current_labels.get(bi, None)
-                        if info:
-                            color = info["color"]
-                            label_txt = info["label_txt"]
+                    if cam_history:
+                        last_entry = list(cam_history.items())[-1]
+                        lbl_plat, lbl_data = last_entry
+                        if lbl_data["status"] == "PAJAK AKTIF":
+                            color = (1, 114, 114)
+                        elif lbl_data["status"] == "PAJAK MATI":
+                            color = (224, 92, 58)
                         else:
-                            color = (180, 180, 180)
-                            label_txt = "Scanning..."
+                            color = (255, 193, 7)
+                        label_txt = f"{lbl_plat} ({lbl_data['status']})"
 
-                        cv2.rectangle(frame_ai, (x1, y1), (x2, y2), color, 3)
-                        cv2.rectangle(frame_ai, (x1, max(y1 - 30, 0)), (x2, y1), color, -1)
-                        cv2.putText(frame_ai, label_txt, (x1 + 6, max(y1 - 8, 14)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
-
-                    # Efek Cermin (Mirror) hanya untuk tampilan UI
-                    frame_final = cv2.flip(frame_ai, 1)
-                    frame_rgb = cv2.cvtColor(frame_final, cv2.COLOR_BGR2RGB)
-
-                    # Process any new detections from background thread in the main thread (thread-safe)
-                    with ai_lock:
-                        local_new_dets = list(ai_new_detections)
-                        ai_new_detections.clear()
-
-                    for det in local_new_dets:
-                        catat_riwayat(
-                            sumber="Kamera",
-                            plat=det["plat"],
-                            masa=det["masa"],
-                            status=det["status"],
-                            conf_yolo=det["conf_yolo"],
-                            conf_ocr=det["conf_ocr"],
-                            raw_ocr=det["raw_ocr"]
-                        )
-
-                    # Thread-safe read for counts and history
-                    with ai_lock:
-                        cnt_total = len(cam_history)
-                        cnt_aktif = total_aktif_c[0]
-                        cnt_mati  = total_mati_c[0]
-                        local_cam_history = dict(cam_history)
-
-                    # Overlay Info Statis
-                    status_text = "LIVE" if not ai_busy[0] else "SCANNING..."
-                    status_color = (0, 255, 0) if not ai_busy[0] else (0, 200, 255)
-                    cv2.putText(frame_rgb, status_text, (10, 28), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2, cv2.LINE_AA)
-                    cv2.putText(frame_rgb, f"Plat Unik: {cnt_total}", (10, 54), 
+                    cv2.rectangle(frame_ai, (x1, y1), (x2, y2), color, 3)
+                    cv2.rectangle(frame_ai, (x1, max(y1 - 30, 0)), (x2, y1), color, -1)
+                    cv2.putText(frame_ai, label_txt, (x1 + 6, max(y1 - 8, 14)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
 
-                    # 1. Render Stream ke UI
-                    frame_holder_cam.image(frame_rgb, use_container_width=True)
+                # Efek Cermin (Mirror) dilakukan di akhir hanya untuk keperluan tampilan di layar (User Interface)
+                frame_final = cv2.flip(frame_ai, 1)
+                frame_rgb = cv2.cvtColor(frame_final, cv2.COLOR_BGR2RGB)
 
-                    # 2. Render Ringkasan Metric
-                    metric_holder_cam.markdown(f"""
-                    <div class='metric-row' style='margin-bottom:14px;'>
-                        <div class='metric-box m-total'>
-                            <div class='metric-label'>Total Plat</div>
-                            <div class='metric-value'>{cnt_total}<span class='metric-unit'>unit</span></div>
-                        </div>
-                        <div class='metric-box m-active'>
-                            <div class='metric-label'><span class='tl-dot tl-green'></span>Aktif</div>
-                            <div class='metric-value'>{cnt_aktif}<span class='metric-unit'>unit</span></div>
-                        </div>
-                        <div class='metric-box m-dead'>
-                            <div class='metric-label'><span class='tl-dot tl-red'></span>Mati</div>
-                            <div class='metric-value'>{cnt_mati}<span class='metric-unit'>unit</span></div>
-                        </div>
+                # Overlay Info Statis di Stream Kamera (Agar teks sistem di pojok ini tidak ikut terbalik)
+                cv2.putText(frame_rgb, f"LIVE CAMERA ACTIVE", (10, 28), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(frame_rgb, f"Plat Unik Terbaca: {len(cam_history)}", (10, 54), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+
+                # 1. Render Stream ke UI
+                frame_holder_cam.image(frame_rgb, use_container_width=True)
+
+                # 2. Render Ringkasan Metric Component
+                metric_holder_cam.markdown(f"""
+                <div class='metric-row' style='margin-bottom:14px;'>
+                    <div class='metric-box m-total'>
+                        <div class='metric-label'>Total Plat</div>
+                        <div class='metric-value'>{len(cam_history)}<span class='metric-unit'>unit</span></div>
                     </div>
-                    """, unsafe_allow_html=True)
+                    <div class='metric-box m-active'>
+                        <div class='metric-label'><span class='tl-dot tl-green'></span>Aktif</div>
+                        <div class='metric-value'>{total_aktif_c}<span class='metric-unit'>unit</span></div>
+                    </div>
+                    <div class='metric-box m-dead'>
+                        <div class='metric-label'><span class='tl-dot tl-red'></span>Mati</div>
+                        <div class='metric-value'>{total_mati_v if 'total_mati_v' in locals() else total_mati_c}<span class='metric-unit'>unit</span></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
-                    # 3. Render Log Kartu Inspeksi Real-time
-                    log_html = "<div style='max-height:380px; overflow-y:auto;'>"
-                    if not local_cam_history:
-                        log_html += "<p style='color:#64748b; font-size:0.85rem; padding:12px 0;'>Menghadapkan plat kendaraan ke kamera...</p>"
-                    else:
-                        for plate_no, data in reversed(list(local_cam_history.items())):
-                            if data["status"] == "PAJAK AKTIF":
-                                rc_c = "rc-active"; bc = "badge-active"; bl = "Aktif"
-                            elif data["status"] == "PAJAK MATI":
-                                rc_c = "rc-expired"; bc = "badge-expired"; bl = "Kedaluwarsa"
-                            else:
-                                rc_c = "rc-unknown"; bc = "badge-unknown"; bl = "Tidak Terbaca"
+                # 3. Render Log Kartu Inspeksi Real-time
+                log_html = "<div style='max-height:380px; overflow-y:auto;'>"
+                if not cam_history:
+                    log_html += "<p style='color:#7A928C; font-size:0.85rem; padding:12px 0;'>Menghadapkan plat kendaraan ke kamera...</p>"
+                else:
+                    for plate_no, data in reversed(list(cam_history.items())):
+                        if data["status"] == "PAJAK AKTIF":
+                            rc_c = "rc-active"; bc = "badge-active"; bl = "Aktif"
+                        elif data["status"] == "PAJAK MATI":
+                            rc_c = "rc-expired"; bc = "badge-expired"; bl = "Kedaluwarsa"
+                        else:
+                            rc_c = "rc-unknown"; bc = "badge-unknown"; bl = "Tidak Terbaca"
 
-                            log_html += f"""
-                            <div class='result-card {rc_c}' style='margin-bottom:10px;'>
-                                <div class='result-header'>
-                                    <div class='result-vehicle-id'>⏱ {data['timestamp']}</div>
-                                    <span class='badge {bc}'>{bl}</span>
-                                </div>
-                                <div class='data-row'>
-                                    <span class='data-key'>No. Plat</span>
-                                    <span class='data-val plate-num'>{plate_no}</span>
-                                </div>
-                                <div class='data-row'>
-                                    <span class='data-key'>Berlaku s/d</span>
-                                    <span class='data-val'>{data['masa']}</span>
-                                </div>
-                                <div class='data-row'>
-                                    <span class='data-key'>Confidence YOLO</span>
-                                    <span class='data-val {conf_class(data['conf_yolo'])}'>{data['conf_yolo']:.1f}%</span>
-                                </div>
-                                <div class='data-row'>
-                                    <span class='data-key'>Confidence OCR</span>
-                                    <span class='data-val {conf_class(data['conf_ocr'])}'>{data['conf_ocr']:.1f}%</span>
-                                </div>
-                            </div>"""
-                    log_html += "</div>"
-                    log_holder_cam.markdown(log_html, unsafe_allow_html=True)
+                        log_html += f"""
+                        <div class='result-card {rc_c}' style='margin-bottom:10px;'>
+                            <div class='result-header'>
+                                <div class='result-vehicle-id'>⏱ {data['timestamp']}</div>
+                                <span class='badge {bc}'>{bl}</span>
+                            </div>
+                            <div class='data-row'>
+                                <span class='data-key'>No. Plat</span>
+                                <span class='data-val plate-num'>{plate_no}</span>
+                            </div>
+                            <div class='data-row'>
+                                <span class='data-key'>Berlaku s/d</span>
+                                <span class='data-val'>{data['masa']}</span>
+                            </div>
+                            <div class='data-row'>
+                                <span class='data-key'>Confidence YOLO</span>
+                                <span class='data-val {conf_class(data['conf_yolo'])}'>{data['conf_yolo']:.1f}%</span>
+                            </div>
+                            <div class='data-row'>
+                                <span class='data-key'>Confidence OCR</span>
+                                <span class='data-val {conf_class(data['conf_ocr'])}'>{data['conf_ocr']:.1f}%</span>
+                            </div>
+                        </div>"""
+                log_html += "</div>"
+                log_holder_cam.markdown(log_html, unsafe_allow_html=True)
 
-                    frame_idx_cam += 1
-            finally:
-                ai_stop[0] = True
-                try:
-                    ai_thread.join(timeout=2)
-                except Exception:
-                    pass
-                cap_cam.release()
+                frame_idx_cam += 1
+                
+            cap_cam.release()
         else:
             st.markdown("""
             <div class='card'>
@@ -1149,11 +1179,11 @@ elif page == "🗂️ Histori Deteksi":
 
                     col_r1, col_r2, col_r3, col_r4, col_r5, col_r6 = st.columns([1.1, 1.3, 1, 1, 1, 1])
                     with col_r1:
-                        st.markdown(f"<span style='font-family:JetBrains Mono, monospace; font-size:0.78rem; color:#64748b;'>{item['waktu']}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span style='font-family:JetBrains Mono, monospace; font-size:0.78rem; color:#556B67;'>{item['waktu']}</span>", unsafe_allow_html=True)
                     with col_r2:
                         st.markdown(f"<span class='data-val plate-num' style='font-size:0.85rem;'>{item['plat']}</span>", unsafe_allow_html=True)
                     with col_r3:
-                        st.markdown(f"<span style='font-size:0.8rem; color:#64748b;'>{item['masa']}</span>", unsafe_allow_html=True)
+                        st.markdown(f"<span style='font-size:0.8rem; color:#556B67;'>{item['masa']}</span>", unsafe_allow_html=True)
                     with col_r4:
                         st.markdown(badge_row, unsafe_allow_html=True)
                     with col_r5:
