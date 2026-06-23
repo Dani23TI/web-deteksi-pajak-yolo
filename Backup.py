@@ -545,108 +545,30 @@ def load_ocr():
 
 def ocr_and_predict(crop_bgr):
     """
-    OCR plat dengan preprocessing multi-strategi.
-
-    Pipeline dasar (ocr_plate() di notebook) hanya menjalankan EasyOCR
-    langsung pada crop mentah. Itu cukup pada gambar Colab yang besar &
-    tajam, tapi pada frame video crop plat sering kecil, blur akibat
-    motion, dan resolusinya rendah — sehingga OCR sering gagal/kosong.
-
-    Untuk mengatasi itu, sebelum OCR dijalankan, crop diproses lewat
-    beberapa varian image processing (upscale, sharpen, denoise, CLAHE
-    + threshold, adaptive threshold, beserta versi invert-nya). EasyOCR
-    dijalankan pada SETIAP varian, lalu hasil dengan teks terpanjang
-    (paling banyak karakter terbaca) yang dipakai.
-
-    Output akhir tetap berupa teks gabungan biasa (sama seperti
-    ocr_plate() asli) sehingga extract_data() / extract_info() di
-    notebook tidak perlu diubah — hanya kualitas input OCR-nya yang
-    ditingkatkan.
+    OCR plat — identik dengan ocr_plate() pada notebook referensi.
+    EasyOCR dijalankan langsung pada crop tanpa preprocessing tambahan
+    (tidak ada CLAHE/threshold/sharpening) agar perilaku deteksi sama
+    persis dengan hasil training/notebook.
+    Return (text_gabungan, confidence_rata_rata_persen).
     """
     reader = load_ocr()
 
     if crop_bgr is None or crop_bgr.size == 0:
         return "", 0.0
 
-    h, w = crop_bgr.shape[:2]
-    if h == 0 or w == 0:
+    try:
+        result = reader.readtext(crop_bgr, detail=1)
+    except Exception:
         return "", 0.0
 
-    # --- 1. Upscale agresif jika crop kecil (umum terjadi di video) ---
-    target_h = 80
-    if h < target_h:
-        scale = target_h / h
-        crop_bgr = cv2.resize(
-            crop_bgr, (max(1, int(w * scale)), max(1, int(h * scale))),
-            interpolation=cv2.INTER_CUBIC
-        )
-        h, w = crop_bgr.shape[:2]
+    if not result:
+        return "", 0.0
 
-    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-    # Upscale tambahan 3x agar karakter lebih besar & tegas untuk OCR
-    gray = cv2.resize(gray, (w * 3, h * 3), interpolation=cv2.INTER_CUBIC)
+    text = " ".join([res[1] for res in result])
+    confs = [res[2] for res in result]
+    avg_conf = (sum(confs) / len(confs)) * 100 if confs else 0.0
 
-    # --- 2. Sharpening — mempertegas tepi karakter yang blur (motion blur video) ---
-    sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharp = cv2.filter2D(gray, -1, sharpen_kernel)
-
-    # --- 3. Denoise — bersihkan noise akibat kompresi video/kamera ---
-    denoised = cv2.fastNlMeansDenoising(sharp, h=15, templateWindowSize=7, searchWindowSize=21)
-
-    # --- 4. Susun beberapa kandidat varian gambar untuk dicoba OCR ---
-    candidates = [gray, denoised]
-
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
-    enhanced = clahe.apply(denoised)
-    candidates.append(enhanced)
-
-    _, thresh_otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    candidates.append(thresh_otsu)
-    candidates.append(cv2.bitwise_not(thresh_otsu))
-
-    thresh_adapt = cv2.adaptiveThreshold(
-        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 19, 9
-    )
-    candidates.append(thresh_adapt)
-    candidates.append(cv2.bitwise_not(thresh_adapt))
-
-    # --- 5. Jalankan EasyOCR pada setiap varian, pilih hasil teks terpanjang ---
-    best_text = ""
-    best_conf = 0.0
-
-    for img_candidate in candidates:
-        try:
-            result = reader.readtext(img_candidate, detail=1)
-        except Exception:
-            continue
-
-        if not result:
-            continue
-
-        texts = [r[1] for r in result]
-        confs = [r[2] for r in result]
-        merged = " ".join(texts).strip()
-        avg_conf = (sum(confs) / len(confs)) * 100 if confs else 0.0
-
-        # Pilih varian yang menghasilkan teks paling panjang
-        # (proxy sederhana untuk "paling banyak karakter berhasil terbaca")
-        if len(merged) > len(best_text):
-            best_text = merged
-            best_conf = avg_conf
-
-    # --- 6. Fallback terakhir: jika semua varian gagal, coba crop mentah asli ---
-    if not best_text:
-        try:
-            result = reader.readtext(crop_bgr, detail=1)
-            if result:
-                best_text = " ".join([r[1] for r in result]).strip()
-                confs = [r[2] for r in result]
-                best_conf = (sum(confs) / len(confs)) * 100 if confs else 0.0
-        except Exception:
-            pass
-
-    return best_text, round(best_conf, 1)
+    return text, round(avg_conf, 1)
 
 
 def extract_data(text):
