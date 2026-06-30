@@ -5,6 +5,7 @@ import re
 import calendar
 import tempfile
 import os
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -179,9 +180,29 @@ def annotate_frame(frame_rgb, boxes, frame_bgr):
     return frame_rgb, detections
 
 
-# --- HISTORI DETEKSI (SESSION STATE) ---
+# --- HISTORI DETEKSI (DATABASE JSON) ---
+DB_PATH = Path("db_riwayat.json")
+
+def load_riwayat():
+    """Baca seluruh riwayat dari file JSON. Jika belum ada/rusak, kembalikan list kosong."""
+    if not DB_PATH.exists():
+        return []
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        return []
+
+
+def save_riwayat(data):
+    """Tulis seluruh riwayat ke file JSON."""
+    with open(DB_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# Muat riwayat dari file JSON ke session_state sekali saat app start
 if "riwayat_deteksi" not in st.session_state:
-    st.session_state.riwayat_deteksi = []   # list of dict — satu entri per kendaraan terdeteksi
+    st.session_state.riwayat_deteksi = load_riwayat()
 
 if "riwayat_detail_idx" not in st.session_state:
     st.session_state.riwayat_detail_idx = None  # index riwayat yang sedang dilihat detailnya
@@ -189,7 +210,8 @@ if "riwayat_detail_idx" not in st.session_state:
 
 def catat_riwayat(sumber, plat, masa, status, conf_yolo, conf_ocr, raw_ocr="-"):
     """
-    Simpan satu hasil deteksi ke histori global (session_state).
+    Simpan satu hasil deteksi ke histori (session_state) DAN langsung
+    tulis ke file db_riwayat.json agar persisten antar sesi.
     Dipanggil otomatis setiap kali deteksi pajak berhasil dijalankan
     dari tab Gambar, Video, atau Kamera Real-time.
     """
@@ -204,6 +226,20 @@ def catat_riwayat(sumber, plat, masa, status, conf_yolo, conf_ocr, raw_ocr="-"):
         "raw_ocr": raw_ocr,
     }
     st.session_state.riwayat_deteksi.append(entry)
+    save_riwayat(st.session_state.riwayat_deteksi)
+
+
+def hapus_riwayat_terpilih(indices):
+    """Hapus entri-entri riwayat berdasarkan kumpulan index, lalu simpan ulang ke JSON.
+    Juga membersihkan state checkbox terkait agar tidak nyangkut di centang lama."""
+    if not indices:
+        return
+    st.session_state.riwayat_deteksi = [
+        item for i, item in enumerate(st.session_state.riwayat_deteksi) if i not in indices
+    ]
+    save_riwayat(st.session_state.riwayat_deteksi)
+    for i in indices:
+        st.session_state.pop(f"chk_riwayat_{i}", None)
 
 
 # --- SIDEBAR ---
@@ -997,7 +1033,7 @@ elif page == "⚙️ Mesin Deteksi Pajak":
 
 
 # ==========================================
-# HALAMAN 4: HISTORI DETEKSI (BARU)
+# HALAMAN 4: HISTORI DETEKSI
 # ==========================================
 elif page == "🗂️ Histori Deteksi":
     st.markdown("""
@@ -1015,9 +1051,16 @@ elif page == "🗂️ Histori Deteksi":
         idx_detail = st.session_state.riwayat_detail_idx
         item = riwayat[idx_detail]
 
-        if st.button("← Kembali ke Daftar Histori"):
-            st.session_state.riwayat_detail_idx = None
-            st.rerun()
+        col_back, col_del = st.columns([3, 1])
+        with col_back:
+            if st.button("← Kembali ke Daftar Histori"):
+                st.session_state.riwayat_detail_idx = None
+                st.rerun()
+        with col_del:
+            if st.button("🗑️ Hapus Entri Ini", use_container_width=True):
+                hapus_riwayat_terpilih({idx_detail})
+                st.session_state.riwayat_detail_idx = None
+                st.rerun()
 
         if item["status"] == "PAJAK AKTIF":
             badge_detail = "<span class='badge badge-active'>Aktif</span>"
@@ -1127,8 +1170,17 @@ elif page == "🗂️ Histori Deteksi":
             </div>
             """, unsafe_allow_html=True)
 
-            # --- Toolbar: filter sumber + tombol bersihkan ---
-            col_f1, col_f2 = st.columns([3, 1])
+            # --- Hitung index yang sedang dicentang LANGSUNG dari session_state ---
+            # (dibaca di awal, sebelum checkbox-nya sendiri dirender di bawah, supaya
+            # tombol "Hapus Terpilih" selalu menampilkan jumlah yang akurat & real-time,
+            # tidak telat satu langkah seperti sebelumnya)
+            selected_indices = {
+                i for i in range(len(riwayat))
+                if st.session_state.get(f"chk_riwayat_{i}", False)
+            }
+
+            # --- Toolbar: filter sumber + hapus terpilih + bersihkan semua ---
+            col_f1, col_f2, col_f3 = st.columns([2.4, 1, 1])
             with col_f1:
                 filter_sumber = st.multiselect(
                     "Filter berdasarkan sumber deteksi",
@@ -1137,8 +1189,17 @@ elif page == "🗂️ Histori Deteksi":
                 )
             with col_f2:
                 st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-                if st.button("🗑️ Bersihkan Histori", use_container_width=True):
+                jumlah_terpilih = len(selected_indices)
+                if st.button(f"🗑️ Hapus Terpilih ({jumlah_terpilih})", use_container_width=True, disabled=(jumlah_terpilih == 0)):
+                    hapus_riwayat_terpilih(selected_indices)
+                    st.rerun()
+            with col_f3:
+                st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+                if st.button("🧹 Bersihkan Semua", use_container_width=True):
+                    for i in range(len(riwayat)):
+                        st.session_state.pop(f"chk_riwayat_{i}", None)
                     st.session_state.riwayat_deteksi = []
+                    save_riwayat([])
                     st.rerun()
 
             st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -1146,6 +1207,7 @@ elif page == "🗂️ Histori Deteksi":
 
             st.markdown("""
             <div class='history-table-head'>
+                <span>Pilih</span>
                 <span>Waktu</span>
                 <span>Nomor Plat</span>
                 <span>Masa Berlaku</span>
@@ -1155,7 +1217,7 @@ elif page == "🗂️ Histori Deteksi":
             </div>
             """, unsafe_allow_html=True)
 
-            # Tampilkan terbaru di atas, simpan index asli untuk keperluan detail
+            # Tampilkan terbaru di atas, simpan index asli untuk keperluan detail & hapus
             indexed_riwayat = list(enumerate(riwayat))
             indexed_riwayat_filtered = [
                 (i, r) for i, r in indexed_riwayat if r["sumber"] in filter_sumber
@@ -1177,7 +1239,12 @@ elif page == "🗂️ Histori Deteksi":
                     else:
                         badge_row = "<span class='badge badge-unknown'>Tidak Terbaca</span>"
 
-                    col_r1, col_r2, col_r3, col_r4, col_r5, col_r6 = st.columns([1.1, 1.3, 1, 1, 1, 1])
+                    col_r0, col_r1, col_r2, col_r3, col_r4, col_r5, col_r6 = st.columns([0.5, 1.1, 1.3, 1, 1, 1, 1])
+                    with col_r0:
+                        st.checkbox(
+                            "pilih", key=f"chk_riwayat_{i}",
+                            label_visibility="collapsed",
+                        )
                     with col_r1:
                         st.markdown(f"<span style='font-family:JetBrains Mono, monospace; font-size:0.78rem; color:#556B67;'>{item['waktu']}</span>", unsafe_allow_html=True)
                     with col_r2:
